@@ -29,6 +29,7 @@ const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
 
 const userStates = {};
 const TEMP_DIR = path.join(__dirname, "temp");
+const MAX_IMAGES = 5;
 
 if (!fs.existsSync(TEMP_DIR)) {
   fs.mkdirSync(TEMP_DIR);
@@ -37,7 +38,7 @@ if (!fs.existsSync(TEMP_DIR)) {
 const ticketFields = [
   { field: "summary", question: "1️⃣ Ingrese el titulo del ticket:" },
   { field: "description", question: "2️⃣ Ingrese la descripción del ticket:" },
-  { field: "image", question: "3️⃣ Adjunte una imagen (opcional):" },
+  { field: "images", question: "3️⃣ Adjunte imágenes (máximo 5, opcional):" },
 ];
 
 function logError(error) {
@@ -121,17 +122,52 @@ bot.on("callback_query", async (callbackQuery) => {
     delete userStates[chatId];
     bot.sendMessage(chatId, "Creación de ticket cancelada.");
     sendMainMenu(chatId);
-  } else if (action === "skip_image") {
+  } else if (action === "finish_images") {
     if (userStates[chatId] && userStates[chatId].creating) {
       const state = userStates[chatId];
 
-      if (ticketFields[state.currentField].field === "image") {
-        state.ticketData.image = null;
+      if (ticketFields[state.currentField].field === "images") {
+        // Move to the next step - which is creating the ticket
         state.currentField++;
 
         bot.sendMessage(
           chatId,
-          "Imagen omitida. Continuando con la creacion del ticket..."
+          `Imágenes guardadas: ${
+            state.ticketData.images ? state.ticketData.images.length : 0
+          }. Continuando con la creación del ticket...`
+        );
+
+        if (state.currentField >= ticketFields.length) {
+          try {
+            await createJiraTicket(
+              chatId,
+              state.ticketData,
+              state.telegramInfo
+            );
+          } catch (error) {
+            bot.sendMessage(
+              chatId,
+              `Error creando el ticket: ${error.message}`
+            );
+          }
+
+          delete userStates[chatId];
+          setTimeout(() => sendMainMenu(chatId), 1000);
+        }
+      }
+    }
+  } else if (action === "skip_images") {
+    if (userStates[chatId] && userStates[chatId].creating) {
+      const state = userStates[chatId];
+
+      if (ticketFields[state.currentField].field === "images") {
+        // Initialize empty images array if skipping
+        state.ticketData.images = [];
+        state.currentField++;
+
+        bot.sendMessage(
+          chatId,
+          "Imágenes omitidas. Continuando con la creación del ticket..."
         );
 
         if (state.currentField >= ticketFields.length) {
@@ -203,62 +239,145 @@ bot.on("message", async (msg) => {
     const state = userStates[chatId];
     const currentField = ticketFields[state.currentField];
 
-    // Handle image upload
-    if (currentField.field === "image") {
+    // Handle image uploads
+    if (currentField.field === "images") {
       if (hasPhoto) {
+        // Initialize images array if it doesn't exist
+        if (!state.ticketData.images) {
+          state.ticketData.images = [];
+          state.statusMessageId = null;
+          state.lastImageTime = 0; // Track last image processing time
+        }
+
+        // Get current time to throttle UI updates
+        const currentTime = Date.now();
+
+        // Check if we've reached the maximum number of images before processing this one
+        if (state.ticketData.images.length >= MAX_IMAGES) {
+          // Only send limit message if we haven't already sent one recently
+          // This prevents multiple messages for batch uploads
+          if (!state.limitMessageId) {
+            const limitMsg = await bot.sendMessage(
+              chatId,
+              `⚠️ Ya has alcanzado el límite máximo de ${MAX_IMAGES} imágenes.`
+            );
+            state.limitMessageId = limitMsg.message_id;
+
+            // Schedule cleanup of the message ID after a delay
+            setTimeout(() => {
+              if (state && state.limitMessageId) {
+                state.limitMessageId = null;
+              }
+            }, 5000); // Reset after 5 seconds
+          }
+          return;
+        }
+
         // Process photo upload
         const photo = msg.photo[msg.photo.length - 1]; // Get the largest photo
         const fileId = photo.file_id;
 
         try {
-          // Save image information for later processing
-          state.ticketData.image = {
+          // Save image information
+          state.ticketData.images.push({
             fileId: fileId,
             processed: false,
-          };
+          });
 
-          bot.sendMessage(chatId, "✅ Imagen recibida correctamente!");
-          state.currentField++;
+          // Throttle UI updates to prevent excessive message edits
+          // Only update status message if it's been at least 1 second since last update
+          // or if we've hit the maximum images
+          const shouldUpdateUI =
+            currentTime - state.lastImageTime > 1000 ||
+            state.ticketData.images.length >= MAX_IMAGES;
 
-          // If we've finished collecting all fields
-          if (state.currentField >= ticketFields.length) {
-            try {
-              await createJiraTicket(
+          if (shouldUpdateUI) {
+            state.lastImageTime = currentTime;
+            const remainingImages = MAX_IMAGES - state.ticketData.images.length;
+
+            // Create image options keyboard
+            const imageOptionsKeyboard = {
+              inline_keyboard: [
+                [
+                  {
+                    text: "✅ Finalizar y crear ticket",
+                    callback_data: "finish_images",
+                  },
+                ],
+                [
+                  {
+                    text: "❌ Cancelar ticket",
+                    callback_data: "cancel_creation",
+                  },
+                ],
+              ],
+            };
+
+            // Update the status message or send a new one
+            const statusMessage = `📸 Imágenes: ${
+              state.ticketData.images.length
+            }/${MAX_IMAGES}\n${
+              remainingImages > 0
+                ? `\nPuedes adjuntar ${remainingImages} imagen${
+                    remainingImages === 1 ? "" : "es"
+                  } más, o finalizar ahora.`
+                : "\n¡Has alcanzado el límite máximo de imágenes!"
+            }`;
+
+            // If we already have a status message, edit it instead of sending a new one
+            if (state.statusMessageId) {
+              try {
+                await bot.editMessageText(statusMessage, {
+                  chat_id: chatId,
+                  message_id: state.statusMessageId,
+                  reply_markup: imageOptionsKeyboard,
+                });
+              } catch (editError) {
+                // If editing fails (e.g., message is too old), send a new message
+                const newStatusMsg = await bot.sendMessage(
+                  chatId,
+                  statusMessage,
+                  { reply_markup: imageOptionsKeyboard }
+                );
+                state.statusMessageId = newStatusMsg.message_id;
+              }
+            } else {
+              // First image, send initial status message
+              const newStatusMsg = await bot.sendMessage(
                 chatId,
-                state.ticketData,
-                state.telegramInfo
+                statusMessage,
+                { reply_markup: imageOptionsKeyboard }
               );
-            } catch (error) {
-              bot.sendMessage(
-                chatId,
-                `Error creando el ticket: ${error.message}`
-              );
+              state.statusMessageId = newStatusMsg.message_id;
             }
-
-            delete userStates[chatId];
-            setTimeout(() => sendMainMenu(chatId), 1000);
           }
         } catch (error) {
           bot.sendMessage(
             chatId,
             `Error procesando la imagen: ${error.message}`
           );
-          state.ticketData.image = null;
         }
       } else {
         // Display image options when user is at the image field but hasn't sent an image yet
         const imageOptionsKeyboard = {
           inline_keyboard: [
-            [{ text: "⏩ Omitir imagen", callback_data: "skip_image" }],
+            [{ text: "⏩ Omitir imágenes", callback_data: "skip_images" }],
             [{ text: "❌ Cancelar ticket", callback_data: "cancel_creation" }],
           ],
         };
 
-        bot.sendMessage(
-          chatId,
-          "Por favor envía una imagen o selecciona una opción:",
-          { reply_markup: imageOptionsKeyboard }
-        );
+        // Only show this message on first entry to the image field or if the user sent text
+        if (
+          !state.ticketData.images ||
+          state.ticketData.images.length === 0 ||
+          text
+        ) {
+          bot.sendMessage(
+            chatId,
+            `Por favor envía hasta ${MAX_IMAGES} imágenes (una por una) o selecciona una opción:`,
+            { reply_markup: imageOptionsKeyboard }
+          );
+        }
         return; // Don't advance to next field
       }
     } else {
@@ -269,11 +388,11 @@ bot.on("message", async (msg) => {
       if (state.currentField < ticketFields.length) {
         let replyMarkup;
 
-        // If we're at the image field, show skip and cancel options
-        if (ticketFields[state.currentField].field === "image") {
+        // If we're at the images field, show skip and cancel options
+        if (ticketFields[state.currentField].field === "images") {
           replyMarkup = {
             inline_keyboard: [
-              [{ text: "⏩ Omitir imagen", callback_data: "skip_image" }],
+              [{ text: "⏩ Omitir imágenes", callback_data: "skip_images" }],
               [
                 {
                   text: "❌ Cancelar ticket",
@@ -331,48 +450,89 @@ async function createJiraTicket(chatId, ticketData, telegramInfo) {
 
     const issue = await jira.addNewIssue(issueData);
 
-    if (ticketData.image && ticketData.image.fileId) {
-      bot.sendMessage(chatId, "⏳ Subiendo imagen a Jira...");
+    // Process images if any
+    if (ticketData.images && ticketData.images.length > 0) {
+      const progressMsg = await bot.sendMessage(
+        chatId,
+        `⏳ Subiendo ${ticketData.images.length} imagen(es) a Jira...`
+      );
 
-      try {
-        const fileInfo = await bot.getFile(ticketData.image.fileId);
-        const filePath = fileInfo.file_path;
-        const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${filePath}`;
+      let successCount = 0;
+      let failCount = 0;
 
-        const tempFilePath = path.join(
-          TEMP_DIR,
-          `${Date.now()}_${path.basename(filePath)}`
-        );
+      // Process each image and update progress
+      for (let i = 0; i < ticketData.images.length; i++) {
+        const imageData = ticketData.images[i];
 
-        const response = await axios({
-          method: "GET",
-          url: fileUrl,
-          responseType: "stream",
-        });
+        try {
+          // Update progress message
+          await bot
+            .editMessageText(
+              `⏳ Subiendo imagenes a Jira... (${i + 1}/${
+                ticketData.images.length
+              })`,
+              {
+                chat_id: chatId,
+                message_id: progressMsg.message_id,
+              }
+            )
+            .catch(() => {
+              /* ignore edit errors */
+            });
 
-        const writer = fs.createWriteStream(tempFilePath);
-        response.data.pipe(writer);
+          const fileInfo = await bot.getFile(imageData.fileId);
+          const filePath = fileInfo.file_path;
+          const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${filePath}`;
 
-        await new Promise((resolve, reject) => {
-          writer.on("finish", resolve);
-          writer.on("error", reject);
-        });
+          const tempFilePath = path.join(
+            TEMP_DIR,
+            `${Date.now()}_${i}_${path.basename(filePath)}`
+          );
 
-        await jira.addAttachmentOnIssue(
-          issue.key,
-          fs.createReadStream(tempFilePath)
-        );
+          const response = await axios({
+            method: "GET",
+            url: fileUrl,
+            responseType: "stream",
+          });
 
-        fs.unlinkSync(tempFilePath);
+          const writer = fs.createWriteStream(tempFilePath);
+          response.data.pipe(writer);
 
-        bot.sendMessage(chatId, "✅ Imagen subida correctamente!");
-      } catch (error) {
-        console.error("Error subiendo imagen a Jira:", error);
-        bot.sendMessage(
-          chatId,
-          "⚠️ No se pudo adjuntar la imagen al ticket: ${imgError.message}"
-        );
+          await new Promise((resolve, reject) => {
+            writer.on("finish", resolve);
+            writer.on("error", reject);
+          });
+
+          await jira.addAttachmentOnIssue(
+            issue.key,
+            fs.createReadStream(tempFilePath)
+          );
+
+          fs.unlinkSync(tempFilePath);
+          successCount++;
+        } catch (error) {
+          console.error(`Error subiendo imagen ${i + 1} a Jira:`, error);
+          failCount++;
+        }
       }
+
+      // Final upload status
+      const uploadStatus =
+        `✅ ${successCount} imagen(es) subida(s) correctamente` +
+        (failCount > 0
+          ? `\n⚠️ ${failCount} imagen(es) no se pudieron subir`
+          : "");
+
+      // Update the progress message with final status
+      await bot
+        .editMessageText(uploadStatus, {
+          chat_id: chatId,
+          message_id: progressMsg.message_id,
+        })
+        .catch(() => {
+          // If editing fails, send a new message
+          bot.sendMessage(chatId, uploadStatus);
+        });
     }
 
     bot.sendMessage(
@@ -504,13 +664,13 @@ async function viewTicketDetails(chatId, ticketKey) {
       issue.fields.created
     ).toLocaleString()}\n*Actualizado:* ${new Date(
       issue.fields.updated
-    ).toLocaleString()}\n\n*Descripcion:*\n${
+    ).toLocaleString()}${telegramInfo}\n\n*Descripcion:*\n${
       issue.fields.description || "No hay descripcion"
     }`;
 
     let attachmentInfo = "";
     if (issue.fields.attachment && issue.fields.attachment.length > 0) {
-      attachmentInfo = "\n\n*Arvhicos adjuntos:*";
+      attachmentInfo = "\n\n*Archivos adjuntos:*\n";
       issue.fields.attachment.forEach((attachment) => {
         attachmentInfo += `- [${attachment.filename}](${attachment.content})\n`;
       });
